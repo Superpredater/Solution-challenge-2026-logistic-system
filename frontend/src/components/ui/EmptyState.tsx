@@ -1,0 +1,29 @@
+import type { LucideIcon } from 'lucide-react'
+import { Inbox } from 'lucide-react'
+
+interface EmptyStateProps {
+  icon?: LucideIcon
+  title: string
+  description?: string
+  action?: React.ReactNode
+}
+
+export function EmptyState({
+  icon: Icon = Inbox,
+  title,
+  description,
+  action,
+}: EmptyStateProps) {
+  return (
+    <div className="flex flex-col items-center justify-center py-16 text-center">
+      <div className="p-4 rounded-full bg-surface mb-4">
+        <Icon size={32} className="text-text-muted" />
+      </div>
+      <h3 className="text-text-primary font-semibold text-lg">{title}</h3>
+      {description && (
+        <p className="text-text-secondary text-sm mt-1 max-w-sm">{description}</p>
+      )}
+      {action && <div className="mt-4">{action}</div>}
+    </div>
+  )
+}

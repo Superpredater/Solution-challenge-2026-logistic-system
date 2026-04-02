@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-bg text-text-primary font-sans;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-surface;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-text-muted;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-accent-blue hover:bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-surface hover:bg-card border border-border text-text-primary px-4 py-2 rounded-lg text-sm font-medium transition-colors;
+  }
+
+  .btn-danger {
+    @apply bg-accent-red hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors;
+  }
+
+  .card {
+    @apply bg-card border border-border rounded-xl p-4;
+  }
+
+  .input {
+    @apply bg-surface border border-border rounded-lg px-3 py-2 text-sm text-text-primary placeholder-text-muted focus:outline-none focus:border-accent-blue transition-colors w-full;
+  }
+
+  .select {
+    @apply bg-surface border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue transition-colors;
+  }
+
+  .table-row-hover {
+    @apply hover:bg-surface/50 transition-colors cursor-pointer;
+  }
+}

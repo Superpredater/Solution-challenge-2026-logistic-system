@@ -1,0 +1,323 @@
+version: "3.9"
+
+networks:
+  supply-chain-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  zookeeper_data:
+
+services:
+  # ─── Infrastructure ───────────────────────────────────────────────────────────
+
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: sc_postgres
+    environment:
+      POSTGRES_USER: scuser
+      POSTGRES_PASSWORD: scpassword
+      POSTGRES_DB: supplychain
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scuser -d supplychain"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - supply-chain-net
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: sc_pgbouncer
+    environment:
+      DATABASE_URL: "postgres://scuser:scpassword@postgres:5432/supplychain"
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 20
+    ports:
+      - "5433:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: sc_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - supply-chain-net
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: sc_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - supply-chain-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: sc_kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - supply-chain-net
+
+  # ─── Application Services ─────────────────────────────────────────────────────
+
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: sc_api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SECRET_KEY: dev-secret-key-change-in-production
+      ENVIRONMENT: development
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - supply-chain-net
+
+  risk-engine:
+    build:
+      context: ./services/risk-engine
+      dockerfile: Dockerfile
+    container_name: sc_risk_engine
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  routing-engine:
+    build:
+      context: ./services/routing-engine
+      dockerfile: Dockerfile
+    container_name: sc_routing_engine
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    container_name: sc_notification
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  geopolitical-engine:
+    build:
+      context: ./services/geopolitical-engine
+      dockerfile: Dockerfile
+    container_name: sc_geopolitical
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  decision-engine:
+    build:
+      context: ./services/decision-engine
+      dockerfile: Dockerfile
+    container_name: sc_decision
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  ai-service:
+    build:
+      context: ./services/ai-service
+      dockerfile: Dockerfile
+    container_name: sc_ai_service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      GEMINI_API_KEY: "AIzaSyCU08HgGEWLdyD4k88SAxpC3O9-EkAPBEk"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  ai-predictor:
+    build:
+      context: ./services/ai-predictor
+      dockerfile: Dockerfile
+    container_name: sc_ai_predictor
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  anomaly-detector:
+    build:
+      context: ./services/anomaly-detector
+      dockerfile: Dockerfile
+    container_name: sc_anomaly
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  digital-twin:
+    build:
+      context: ./services/digital-twin
+      dockerfile: Dockerfile
+    container_name: sc_digital_twin
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  carbon-calculator:
+    build:
+      context: ./services/carbon-calculator
+      dockerfile: Dockerfile
+    container_name: sc_carbon
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  carrier-risk-profiler:
+    build:
+      context: ./services/carrier-risk-profiler
+      dockerfile: Dockerfile
+    container_name: sc_carrier_risk
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  collaboration-workspace:
+    build:
+      context: ./services/collaboration-workspace
+      dockerfile: Dockerfile
+    container_name: sc_collaboration
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net
+
+  data-ingestion:
+    build:
+      context: ./services/data-ingestion
+      dockerfile: Dockerfile
+    container_name: sc_data_ingestion
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scuser:scpassword@pgbouncer:5432/supplychain
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - supply-chain-net

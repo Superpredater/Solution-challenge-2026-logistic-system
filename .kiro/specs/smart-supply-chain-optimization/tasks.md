@@ -1,0 +1,557 @@
+# Implementation Plan: Smart Supply Chain Optimization
+
+## Overview
+
+Incremental implementation of the AI-powered logistics intelligence platform. Each task builds on the previous, wiring components together progressively. The stack is Python (FastAPI) + Kafka + PostgreSQL/TimescaleDB + Redis + React/TypeScript frontend.
+
+## Tasks
+
+- [x] 1. Project scaffolding and infrastructure setup
+  - Create monorepo directory structure: `services/`, `frontend/`, `edge-agent/`, `infra/`, `tests/`
+  - Write `docker-compose.yml` with PostgreSQL 16 + TimescaleDB extension, Redis 7, Kafka + Zookeeper, and a stub FastAPI service
+  - Write Kubernetes manifests (Deployments, Services, HPA) for all backend services under `infra/k8s/`
+  - Write Alembic migration scaffolding and base SQLAlchemy models with RLS helper
+  - Configure PgBouncer connection pooling config
+  - Write `pyproject.toml` / `requirements.txt` for shared Python dependencies (FastAPI, Pydantic v2, SQLAlchemy 2, aiokafka, hypothesis, pytest, pytest-asyncio, testcontainers)
+  - _Requirements: 6.5, 8.1_
+
+- [x] 2. Core data models and database schema
+  - [x] 2.1 Implement all Pydantic v2 models: `Tenant`, `Stakeholder`, `Shipment`, `Route`, `RouteLeg`, `TransitNode`, `Disruption`, `Alert`, `AlertDelivery`, `RerouteRecommendation`, `GeopoliticalRegion`, `CarrierProfile`, `RiskScoreEvent`, `AIInteractionLog`, `DecisionAuditEntry`, `EdgeAgent`
+    - Add field validators for bounded ranges (risk scores 0–100, on-time rates 0–1)
+    - _Requirements: 3.1, 8.1, 14.1, 22.3_
+  - [x] 2.2 Write Alembic migrations for all tables including TimescaleDB hypertable for `risk_score_events`, composite indexes, and PostgreSQL RLS policies enforcing `tenant_id` isolation
+    - _Requirements: 8.1, 7.1_
+  - [ ]* 2.3 Write property test for Risk_Score bounded invariant
+    - **Property 1: Risk Score Bounded Invariant**
+    - **Validates: Requirements 3.1, 21.3, 22.3**
+  - [ ]* 2.4 Write property test for Geopolitical_Risk_Index bounded invariant
+    - **Property 34: Geopolitical Risk Index Bounded Invariant**
+    - **Validates: Requirements 22.3**
+
+- [x] 3. Auth Service — JWT, MFA, RBAC, tenant isolation
+  - [x] 3.1 Implement `AuthService`: RS256 JWT issuance and verification, configurable expiry, refresh token rotation
+    - _Requirements: 8.5, 8.4_
+  - [x] 3.2 Implement TOTP-based MFA: secret generation, TOTP verification, enforcement gate for tenants with `mfa_enabled=true`
+    - _Requirements: 8.6_
+  - [x] 3.3 Implement RBAC middleware: role claim extraction from JWT, permission matrix enforcement (Viewer/Analyst/Manager/Admin), `403` response with audit log on denial
+    - _Requirements: 8.3, 8.7, 8.2_
+  - [x] 3.4 Implement PostgreSQL RLS activation helper: sets `app.tenant_id` session variable on every DB connection so RLS policies filter automatically
+    - _Requirements: 8.1_
+  - [ ]* 3.5 Write property test for tenant data isolation
+    - **Property 19: Tenant Data Isolation**
+    - **Validates: Requirements 8.1, 8.2**
+  - [ ]* 3.6 Write property test for RBAC enforcement at API layer
+    - **Property 20: RBAC Enforcement at API Layer**
+    - **Validates: Requirements 8.3, 8.7**
+  - [ ]* 3.7 Write property test for MFA enforcement
+    - **Property 21: MFA Enforcement**
+    - **Validates: Requirements 8.6**
+  - [ ]* 3.8 Write unit tests for Auth Service
+    - Test JWT expiry, invalid signature rejection, refresh token rotation, cross-tenant JWT rejection
+    - _Requirements: 8.4, 8.5_
+
+- [ ] 4. Checkpoint — Auth and schema baseline
+  - Ensure all migrations apply cleanly, RLS policies block cross-tenant queries, JWT round-trip works, and all property tests pass. Ask the user if questions arise.
+
+- [x] 5. Data Ingestion Pipeline
+  - [x] 5.1 Implement `SchemaValidator` using Pydantic v2: validates incoming payloads against `InternalEvent` schema; on failure writes structured error to `ingestion.dlq` Kafka topic and continues
+    - _Requirements: 6.3, 1.5_
+  - [x] 5.2 Implement `Normalizer`: transforms source-specific payloads (carrier, weather, port, news, GPS) into canonical `InternalEvent` format
+    - _Requirements: 6.2_
+  - [x] 5.3 Implement `RestPoller`: async scheduled polling of carrier REST APIs and weather endpoints with configurable interval per source; feeds normalized events to Kafka topics `raw.weather.events`, `raw.carrier.updates`, `raw.port.events`
+    - _Requirements: 6.1, 2.1_
+  - [x] 5.4 Implement `WebhookReceiver`: FastAPI endpoints accepting push events from port authorities and carrier systems; validates, normalizes, and publishes to Kafka
+    - _Requirements: 6.1_
+  - [x] 5.5 Implement `KafkaConsumer` wrapper: subscribes to external Kafka/SQS topics (carrier delay feeds, news aggregators) and publishes to internal topics
+    - _Requirements: 6.1_
+  - [x] 5.6 Implement `BacklogProcessor`: on source reconnection, replays buffered events in chronological order; publishes to `raw.news.events` and `raw.shipment.positions`
+    - _Requirements: 6.4_
+  - [ ]* 5.7 Write property test for ingestion normalization round trip
+    - **Property 16: Ingestion Normalization Round Trip**
+    - **Validates: Requirements 6.2**
+  - [ ]* 5.8 Write property test for invalid record rejection and DLQ logging
+    - **Property 17: Invalid Record Rejection and Logging**
+    - **Validates: Requirements 6.3, 1.5**
+  - [ ]* 5.9 Write property test for backlog chronological ordering
+    - **Property 18: Backlog Chronological Ordering**
+    - **Validates: Requirements 6.4, 19.2**
+  - [ ]* 5.10 Write unit tests for ingestion pipeline
+    - Test DLQ write on schema failure, throughput benchmark (50K events/min), source reconnection replay
+    - _Requirements: 6.5, 1.5_
+
+- [x] 6. Geopolitical Engine
+  - [x] 6.1 Implement `RegionRegistry`: CRUD for `GeopoliticalRegion` records; exposes region lookup by ISO code and geometry
+    - _Requirements: 22.3_
+  - [x] 6.2 Implement `NLPSignalExtractor`: fine-tuned transformer (or spaCy pipeline) extracting geopolitical signals (sanctions, instability, trade restrictions) from news text; supports 5+ languages via `langdetect` + translation pre-processing
+    - _Requirements: 22.2, 22.6_
+  - [x] 6.3 Implement `GeopoliticalIndexUpdater`: consumes from `raw.news.events`; updates `geopolitical_risk_index` per region; detects 20+ point increases in 24h windows and publishes to `geopolitical.risk.updates`
+    - _Requirements: 22.3, 22.4_
+  - [x] 6.4 Implement `WarStateClassifier`: classifies regions as Safe/Caution/High_Risk/Restricted from conflict data; monitors airspace closures and naval blockades; publishes to `war.state.updates`
+    - _Requirements: 21.1, 21.7_
+  - [x] 6.5 Implement `NewsIngestionConsumer`: consumes `raw.news.events`, routes to `NLPSignalExtractor` and `GeopoliticalIndexUpdater`
+    - _Requirements: 22.1_
+  - [ ]* 6.6 Write property test for Geopolitical_Risk_Index bounded invariant (integration with updater)
+    - **Property 34: Geopolitical Risk Index Bounded Invariant**
+    - **Validates: Requirements 22.3**
+  - [ ]* 6.7 Write property test for geopolitical spike disruption trigger
+    - **Property 35: Geopolitical Spike Disruption Trigger**
+    - **Validates: Requirements 22.4**
+  - [ ]* 6.8 Write unit tests for Geopolitical Engine
+    - Test NLP extraction accuracy on sample news fixtures, 5-minute update SLA, War_State transition logic
+    - _Requirements: 22.3, 21.2_
+
+- [x] 7. Risk Engine
+  - [x] 7.1 Implement `WeatherRiskEvaluator`, `OperationalRiskEvaluator`, `WarStateEvaluator`, `GeopoliticalRiskEvaluator`: each returns a 0–100 float for its dimension given current event data
+    - `WarStateEvaluator` must add minimum 30 points for High_Risk/Restricted regions
+    - _Requirements: 3.2, 21.3, 23.1_
+  - [x] 7.2 Implement `RiskAggregator`: combines four dimension scores using tenant-configurable weights into unified `Risk_Score = clamp(weighted_sum, 0, 100)`
+    - _Requirements: 3.1, 23.1_
+  - [x] 7.3 Implement `EscalationDetector`: maintains a 1-hour sliding window of Risk_Score history per shipment; detects ≥20-point increases and publishes to `risk.escalations`
+    - _Requirements: 3.3_
+  - [x] 7.4 Implement `ScheduledRecalculator`: background task ensuring every active shipment is recalculated at least every 15 minutes; publishes to `risk.score.updates`
+    - _Requirements: 3.4_
+  - [x] 7.5 Wire Risk Engine Kafka consumers: consume `raw.weather.events`, `raw.carrier.updates`, `raw.port.events`, `geopolitical.risk.updates`, `war.state.updates`; trigger recalculation for affected shipments; publish `risk.score.updates` and `disruption.detected`
+    - _Requirements: 2.2, 2.3_
+  - [ ]* 7.6 Write property test for Risk_Score bounded invariant
+    - **Property 1: Risk Score Bounded Invariant**
+    - **Validates: Requirements 3.1, 21.3, 22.3**
+  - [ ]* 7.7 Write property test for Risk_Score incorporates all four dimensions
+    - **Property 2: Risk Score Incorporates All Four Dimensions**
+    - **Validates: Requirements 3.2, 23.1**
+  - [ ]* 7.8 Write property test for War-State risk score floor
+    - **Property 3: War-State Risk Score Floor**
+    - **Validates: Requirements 21.3**
+  - [ ]* 7.9 Write property test for Risk_Score update latency
+    - **Property 4: Risk Score Update Latency**
+    - **Validates: Requirements 2.3, 23.2**
+  - [ ]* 7.10 Write property test for periodic recalculation freshness
+    - **Property 5: Periodic Recalculation Freshness**
+    - **Validates: Requirements 3.4**
+  - [ ]* 7.11 Write property test for Risk_Escalation alert trigger
+    - **Property 6: Risk Escalation Alert Trigger**
+    - **Validates: Requirements 3.3**
+  - [ ]* 7.12 Write unit tests for Risk Engine
+    - Test weight normalization, carrier score incorporation, dwell-time bottleneck detection, data-source-unavailable floor (Risk_Score ≥ 50)
+    - _Requirements: 3.2, 2.4, 2.5, 14.2_
+
+- [x] 8. Carrier Risk Profiler
+  - [x] 8.1 Implement `PerformanceTracker`: maintains rolling 90-day on-time delivery rate, incident history, and capacity reliability per carrier in PostgreSQL
+    - _Requirements: 14.1_
+  - [x] 8.2 Implement `RiskScoreComputer`: produces carrier risk score (0–100) from performance metrics; exposes score for Risk Engine's operational dimension
+    - _Requirements: 14.2_
+  - [x] 8.3 Implement `HighRiskFlagDetector`: monitors 30-day on-time rate; sets `is_high_risk=true` and publishes admin notification when rate drops below 80%
+    - _Requirements: 14.3_
+  - [ ]* 8.4 Write property test for carrier High-Risk flag trigger
+    - **Property 29: Carrier High-Risk Flag Trigger**
+    - **Validates: Requirements 14.3**
+  - [ ]* 8.5 Write unit tests for Carrier Risk Profiler
+    - Test rolling window calculation, flag set/clear lifecycle, score incorporation into Risk Engine
+    - _Requirements: 14.1, 14.2, 14.3_
+
+- [ ] 9. Checkpoint — Risk pipeline end-to-end
+  - Ensure ingestion → Geopolitical Engine → Risk Engine → Kafka topics flow correctly, Risk_Score updates within 2 minutes, escalation detection fires, carrier scores feed into risk calculation. Ask the user if questions arise.
+
+- [x] 10. Carbon Calculator
+  - [x] 10.1 Implement `EmissionsComputer`: calculates CO₂ kg per shipment leg using transport mode, distance (Haversine), and carrier emissions factors table
+    - _Requirements: 13.1_
+  - [x] 10.2 Implement `RouteCarbonDeltaCalculator`: computes CO₂ delta between current and alternative routes; attaches result to `RerouteRecommendation`
+    - _Requirements: 13.2_
+  - [x] 10.3 Implement `TenantEmissionsAggregator`: aggregates cumulative CO₂ per tenant over user-selected time periods using TimescaleDB continuous aggregates
+    - _Requirements: 13.4_
+  - [ ]* 10.4 Write unit tests for Carbon Calculator
+    - Test emissions computation per mode, delta calculation, aggregation query correctness
+    - _Requirements: 13.1, 13.2, 13.4_
+
+- [x] 11. Routing Engine
+  - [x] 11.1 Implement `RouteGraph`: in-memory weighted directed graph (NetworkX or custom adjacency list) of transit nodes and transport links; updated from Kafka `war.state.updates` and `disruption.detected`
+    - _Requirements: 16.1_
+  - [x] 11.2 Implement `RestrictionFilter`: removes graph edges passing through War_State Restricted regions or disrupted infrastructure before route search
+    - _Requirements: 4.2, 16.4, 21.4_
+  - [x] 11.3 Implement `MultiModalPlanner`: Dijkstra/A* over `RouteGraph` evaluating hybrid air/sea/rail/road routes; returns top-N candidate routes with per-leg mode, handoff nodes, time, and cost
+    - _Requirements: 16.2, 16.3_
+  - [x] 11.4 Implement `RouteScorer`: scores candidate routes on cost, transit time, risk score, and CO₂ delta (calls `RouteCarbonDeltaCalculator`)
+    - _Requirements: 4.3_
+  - [x] 11.5 Implement `EcoRankingAdjuster`: re-ranks routes for tenants with `eco_routing_enabled=true`; CO₂-minimizing route ranked first unless it increases transit time by >20%
+    - _Requirements: 13.3_
+  - [x] 11.6 Implement `DemandPriorityWeighter`: applies demand-zone priority weighting to shipment routing when `demand_priority` is Elevated or High
+    - _Requirements: 15.3_
+  - [x] 11.7 Implement `RecommendationPublisher`: consumes `risk.score.updates`; triggers recommendation generation for shipments with Risk_Score > 70; publishes `RerouteRecommendation` to `routing.recommendations`; sends no-viable-route notification when no alternative exists
+    - _Requirements: 4.1, 4.4, 4.5_
+  - [ ]* 11.8 Write property test for reroute recommendation generated for high-risk shipments
+    - **Property 7: Reroute Recommendation Generated for High-Risk Shipments**
+    - **Validates: Requirements 4.1, 4.4**
+  - [ ]* 11.9 Write property test for restricted region exclusion from routes
+    - **Property 8: Restricted Region Exclusion from Routes**
+    - **Validates: Requirements 4.2, 16.4, 21.4**
+  - [ ]* 11.10 Write property test for reroute recommendation structural completeness
+    - **Property 9: Reroute Recommendation Structural Completeness**
+    - **Validates: Requirements 4.3, 13.2, 16.3**
+  - [ ]* 11.11 Write property test for eco-routing ranking invariant
+    - **Property 28: Eco-Routing Ranking Invariant**
+    - **Validates: Requirements 13.3**
+  - [ ]* 11.12 Write property test for demand priority elevation
+    - **Property 30: Demand Priority Elevation**
+    - **Validates: Requirements 15.2, 15.3**
+  - [ ]* 11.13 Write unit tests for Routing Engine
+    - Test multi-modal route generation, restriction filter, no-viable-route path, eco-ranking 20% time cap
+    - _Requirements: 4.1, 4.2, 4.5, 13.3, 16.2_
+
+- [x] 12. Decision Engine
+  - [x] 12.1 Implement `AutonomousExecutor`: consumes `routing.recommendations`; when `autonomous_decision_enabled=true` and Risk_Score > 70, applies highest-ranked recommendation; publishes to `shipment.route.updates`
+    - _Requirements: 11.1_
+  - [x] 12.2 Implement `OverrideHandler`: processes Manager/Admin manual overrides; reverts shipment to specified route within 2 minutes; publishes override event
+    - _Requirements: 11.3_
+  - [x] 12.3 Implement `AuditLogger`: writes `DecisionAuditEntry` for every autonomous decision and override with all required fields
+    - _Requirements: 11.2, 11.3_
+  - [x] 12.4 Implement `DecisionAuditAPI`: FastAPI endpoints exposing audit trail to Manager/Admin with configurable lookback period
+    - _Requirements: 11.4_
+  - [ ]* 12.5 Write property test for autonomous decision audit completeness
+    - **Property 25: Autonomous Decision Audit Completeness**
+    - **Validates: Requirements 11.2**
+  - [ ]* 12.6 Write property test for manual override audit completeness
+    - **Property 26: Manual Override Audit Completeness**
+    - **Validates: Requirements 11.3**
+  - [ ]* 12.7 Write property test for route acceptance round trip
+    - **Property 10: Route Acceptance Round Trip**
+    - **Validates: Requirements 4.6**
+  - [ ]* 12.8 Write unit tests for Decision Engine
+    - Test autonomous trigger threshold, override 2-minute SLA, audit entry completeness, role restriction on override
+    - _Requirements: 11.1, 11.2, 11.3, 11.4_
+
+- [ ] 13. Checkpoint — Routing and Decision pipeline
+  - Ensure Risk Engine → Routing Engine → Decision Engine → audit trail flows end-to-end, autonomous decisions fire correctly, overrides revert within 2 minutes, all property tests pass. Ask the user if questions arise.
+
+- [x] 14. Notification Service
+  - [x] 14.1 Implement `AlertClassifier`: assigns severity (Informational/Warning/Critical) based on Risk_Score range and trigger type; War_State/geopolitical spike triggers always produce Critical
+    - _Requirements: 24.1, 24.2_
+  - [x] 14.2 Implement `DeduplicationFilter`: suppresses duplicate alerts for the same (disruption, shipment, stakeholder) triple within 30-minute windows using Redis sorted sets
+    - _Requirements: 5.6_
+  - [x] 14.3 Implement `QuietPeriodEnforcer`: suppresses non-critical alerts during configured quiet periods; queues digest; bypasses for Critical alerts
+    - _Requirements: 5.5, 24.3, 21.5_
+  - [x] 14.4 Implement `EmailSender` (SendGrid/SES), `SMSSender` (Twilio), `WebhookDispatcher` (HMAC-signed HTTP POST): each with 3-attempt exponential backoff (30s, 60s, 120s)
+    - _Requirements: 5.2, 5.4_
+  - [x] 14.5 Implement `DeliveryAuditLogger`: records delivery timestamp, channel, recipient, retry count for every attempt
+    - _Requirements: 5.3_
+  - [x] 14.6 Wire Notification Service Kafka consumers: consume `disruption.detected`, `risk.escalations`, `war.state.updates`, `anomaly.detected`, `decision.audit.events`; route through classifier → dedup → quiet period → sender
+    - _Requirements: 5.1_
+  - [ ]* 14.7 Write property test for alert delivery deduplication
+    - **Property 11: Alert Delivery Deduplication**
+    - **Validates: Requirements 5.6**
+  - [ ]* 14.8 Write property test for alert delivery audit record
+    - **Property 12: Alert Delivery Audit Record**
+    - **Validates: Requirements 5.3**
+  - [ ]* 14.9 Write property test for alert retry bounded backoff
+    - **Property 13: Alert Retry Bounded Backoff**
+    - **Validates: Requirements 5.4**
+  - [ ]* 14.10 Write property test for Critical alert bypasses quiet period
+    - **Property 14: Critical Alert Bypasses Quiet Period**
+    - **Validates: Requirements 21.5, 24.3**
+  - [ ]* 14.11 Write property test for alert severity classification invariant
+    - **Property 15: Alert Severity Classification Invariant**
+    - **Validates: Requirements 24.1, 24.2, 24.5**
+  - [ ]* 14.12 Write unit tests for Notification Service
+    - Test 5-minute delivery SLA, digest queuing, HMAC webhook signature, undeliverable marking
+    - _Requirements: 5.1, 5.4, 5.5_
+
+- [x] 15. Anomaly Detector
+  - [x] 15.1 Implement `RouteDeviationMonitor`: compares real-time GPS positions against planned route using Haversine; triggers alert when deviation exceeds configurable threshold (default 50km)
+    - _Requirements: 18.1_
+  - [x] 15.2 Implement `BehavioralPatternAnalyzer`: applies isolation forest model to detect cargo theft/fraud patterns (unexpected stops, unauthorized node visits, abnormal dwell times)
+    - _Requirements: 18.3_
+  - [x] 15.3 Implement `FraudEscalator`: on fraud/theft detection, escalates to Admin stakeholders, logs full shipment state snapshot, publishes to `anomaly.detected`
+    - _Requirements: 18.4_
+  - [ ]* 15.4 Write property test for route deviation anomaly detection
+    - **Property 43: Route Deviation Anomaly Detection**
+    - **Validates: Requirements 18.1, 18.2**
+  - [ ]* 15.5 Write property test for fraud escalation audit completeness
+    - **Property 44: Fraud Escalation Audit Completeness**
+    - **Validates: Requirements 18.4**
+  - [ ]* 15.6 Write unit tests for Anomaly Detector
+    - Test 50km threshold, 2-minute alert SLA, behavioral pattern fixtures, escalation log immutability
+    - _Requirements: 18.1, 18.2, 18.3, 18.4_
+
+- [x] 16. AI Service — Gemini Integration
+  - [x] 16.1 Implement `GeminiClient`: async wrapper around Gemini API with 5-second timeout, 3-attempt retry, and circuit breaker (opens after 3 consecutive failures)
+    - _Requirements: 25.7, 25.8_
+  - [x] 16.2 Implement `FallbackExplainer`: rule-based template explanation generator activated when circuit breaker is open; logs degraded-mode event to `system.degraded_mode.events` Kafka topic
+    - _Requirements: 25.8_
+  - [x] 16.3 Implement `AIInteractionLogger`: writes `AIInteractionLog` entry for every AI interaction before returning response
+    - _Requirements: 25.9_
+  - [x] 16.4 Implement `RiskExplainer`: triggered by significant Risk_Score changes (≥15 points); constructs structured prompt with contributing factors; calls `GeminiClient`; publishes explanation to `ai.explanations`
+    - _Requirements: 25.2_
+  - [x] 16.5 Implement `NewsEventSummarizer`: triggered by `raw.news.events`; generates concise event summary and projected supply chain impact; publishes to `ai.summaries`
+    - _Requirements: 25.4_
+  - [x] 16.6 Implement `AnomalyExplainer`: triggered by `anomaly.detected`; generates explanation and suggested response actions
+    - _Requirements: 25.5_
+  - [x] 16.7 Implement `NarrativeReportGenerator`: generates automated narrative reports (performance summary, disruption trends, risk outlook) on demand
+    - _Requirements: 25.6_
+  - [x] 16.8 Implement `ChatbotHandler`: processes natural language queries; maintains conversation context per session in Redis; injects relevant shipment/risk context into Gemini prompt
+    - _Requirements: 25.3_
+  - [ ]* 16.9 Write property test for Gemini risk explanation generation
+    - **Property 36: Gemini Risk Explanation Generation**
+    - **Validates: Requirements 25.2, 25.7**
+  - [ ]* 16.10 Write property test for Gemini fallback on API unavailability
+    - **Property 37: Gemini Fallback on API Unavailability**
+    - **Validates: Requirements 25.8**
+  - [ ]* 16.11 Write property test for AI interaction audit completeness
+    - **Property 38: AI Interaction Audit Completeness**
+    - **Validates: Requirements 25.9**
+  - [ ]* 16.12 Write property test for news event summary generation
+    - **Property 39: News Event Summary Generation**
+    - **Validates: Requirements 25.4**
+  - [ ]* 16.13 Write property test for anomaly explanation generation
+    - **Property 40: Anomaly Explanation Generation**
+    - **Validates: Requirements 25.5**
+  - [ ]* 16.14 Write property test for chatbot response latency
+    - **Property 45: Chatbot Response Latency**
+    - **Validates: Requirements 25.3, 25.7**
+  - [ ]* 16.15 Write unit tests for AI Service
+    - Test circuit breaker open/close, fallback activation, degraded-mode event log, chatbot context injection, 5-second SLA
+    - _Requirements: 25.7, 25.8, 25.9_
+
+- [ ] 17. Checkpoint — AI and Notification pipeline
+  - Ensure Anomaly Detector → AI Service → Notification Service flows correctly, Gemini fallback activates on mock failure, all AI audit entries are written, all property tests pass. Ask the user if questions arise.
+
+- [ ] 18. AI Predictor — ETA and Demand Forecasting
+  - [ ] 18.1 Implement `ETAPredictor`: LightGBM gradient boosting model trained on historical transit data, carrier performance, and route characteristics; exposes `predict(shipment) -> (eta, lower_bound, upper_bound)`
+    - _Requirements: 10.1, 10.2_
+  - [ ] 18.2 Implement `ConfidenceIntervalEstimator`: quantile regression wrapper producing lower/upper bounds; ensures point estimate falls within interval
+    - _Requirements: 10.5_
+  - [ ] 18.3 Implement `DemandForecaster`: Prophet/LSTM time-series model generating 7-day demand forecasts per geographic zone; stores results in PostgreSQL; triggers `demand_priority` elevation when forecast exceeds threshold
+    - _Requirements: 15.1, 15.2_
+  - [ ] 18.4 Implement `ModelTrainer`: scheduled retraining pipeline (every 24 hours) using latest historical data; stores versioned model artifacts in S3 with MLflow tracking
+    - _Requirements: 10.3_
+  - [ ] 18.5 Implement `FeedbackCollector`: captures actual delivery timestamps from `shipment.route.updates`; writes feedback records for next training cycle
+    - _Requirements: 10.4_
+  - [ ]* 18.6 Write property test for ETA prediction confidence interval presence
+    - **Property 24: ETA Prediction Confidence Interval Presence**
+    - **Validates: Requirements 10.5**
+  - [ ]* 18.7 Write unit tests for AI Predictor
+    - Test MAPE < 10% on held-out validation set, confidence interval containment, demand threshold elevation, feedback record creation
+    - _Requirements: 10.2, 10.4, 15.1_
+
+- [x] 19. Digital Twin
+  - [x] 19.1 Implement `NetworkModelBuilder`: constructs snapshot of current supply chain network (shipments, routes, nodes, carrier capacities) from PostgreSQL; supports up to 10,000 concurrent shipments per scenario
+    - _Requirements: 12.1, 12.2_
+  - [x] 19.2 Implement `ScenarioEngine`: accepts scenario parameters (conflict zone activation, node closure, capacity reduction, weather injection); applies them to the network model copy
+    - _Requirements: 12.4_
+  - [x] 19.3 Implement `ImpactCalculator`: computes projected ETA deviations and Risk_Score changes for affected shipments within the scenario; must complete within 60 seconds
+    - _Requirements: 12.3_
+  - [x] 19.4 Implement `SimulationReportGenerator`: produces summary report with affected shipment count, average ETA deviation, and mitigation recommendations
+    - _Requirements: 12.5_
+  - [ ]* 19.5 Write property test for Digital Twin simulation report completeness
+    - **Property 27: Digital Twin Simulation Report Completeness**
+    - **Validates: Requirements 12.5**
+  - [ ]* 19.6 Write unit tests for Digital Twin
+    - Test 60-second SLA for 10,000-shipment scenario, conflict zone injection, node closure impact, report field completeness
+    - _Requirements: 12.2, 12.3, 12.5_
+
+- [x] 20. Edge Agent
+  - [x] 20.1 Implement `LocalBuffer`: SQLite-backed buffer storing shipment location and status updates with `recorded_at` timestamp when offline
+    - _Requirements: 19.1_
+  - [x] 20.2 Implement `LocalRuleEngine`: applies cached routing and risk rules (JSON) for best-effort local guidance during offline periods
+    - _Requirements: 19.3_
+  - [x] 20.3 Implement `SyncManager`: on reconnection, reads buffered events ordered by `recorded_at ASC`, uploads in batches of 500 to `/api/v1/edge/sync`, completes within 60 seconds
+    - _Requirements: 19.2_
+  - [x] 20.4 Implement `OfflineMonitor` (central service): tracks last heartbeat per Edge Agent; flags shipments as `Connectivity_Impaired` after 30 minutes of silence; clears flag on next heartbeat
+    - _Requirements: 19.4_
+  - [ ]* 20.5 Write property test for Edge Agent sync ordering
+    - **Property 31: Edge Agent Sync Ordering**
+    - **Validates: Requirements 19.2**
+  - [ ]* 20.6 Write property test for Edge Agent offline flag
+    - **Property 32: Edge Agent Offline Flag**
+    - **Validates: Requirements 19.4**
+  - [ ]* 20.7 Write unit tests for Edge Agent
+    - Test offline buffering, chronological sync upload, 60-second sync SLA, heartbeat flag lifecycle
+    - _Requirements: 19.1, 19.2, 19.3, 19.4_
+
+- [x] 21. Collaboration Workspace
+  - [x] 21.1 Implement `MessageChannel`: per-shipment threaded message channel stored in PostgreSQL; WebSocket delivery via Redis pub/sub fan-out within 5 seconds; 24-month retention
+    - _Requirements: 17.1, 17.2, 17.4_
+  - [x] 21.2 Implement `TaskManager`: task CRUD with assignment, due date, and status (Open/In Progress/Resolved); scoped to shipment and tenant
+    - _Requirements: 17.3_
+  - [x] 21.3 Implement `AlertAutoPost`: subscribes to `disruption.detected`; automatically posts disruption summary into the relevant shipment's channel within the 5-minute alert SLA
+    - _Requirements: 17.5_
+  - [ ]* 21.4 Write property test for Collaboration Workspace alert auto-post
+    - **Property 42: Collaboration Workspace Alert Auto-Post**
+    - **Validates: Requirements 17.5**
+  - [ ]* 21.5 Write unit tests for Collaboration Workspace
+    - Test WebSocket delivery latency, task status transitions, auto-post on disruption, 24-month retention query
+    - _Requirements: 17.2, 17.3, 17.4, 17.5_
+
+- [ ] 22. Checkpoint — Supporting services
+  - Ensure AI Predictor, Digital Twin, Edge Agent, and Collaboration Workspace all function correctly in isolation and integrate with the Kafka backbone. Ask the user if questions arise.
+
+- [x] 23. API Gateway — rate limiting, versioning, developer analytics
+  - [x] 23.1 Implement API Gateway middleware in FastAPI: routes requests to REST and GraphQL handlers; enforces per-`(tenant_id, api_key)` rate limits using Redis token bucket; returns `429 Too Many Requests` with `Retry-After` header and structured JSON error body
+    - _Requirements: 20.2_
+  - [x] 23.2 Implement API versioning: URL prefix `/api/v1/`; version negotiation middleware; previous version supported for 90 days after breaking change; deprecation notice header
+    - _Requirements: 20.4_
+  - [x] 23.3 Implement developer analytics collector: records API call volume, error rates, and latency percentiles per API key in TimescaleDB; exposes 30-day rolling window to Admin via `/api/v1/developer/analytics`
+    - _Requirements: 20.3_
+  - [ ]* 23.4 Write property test for rate limit structured error
+    - **Property 33: Rate Limit Structured Error**
+    - **Validates: Requirements 20.2**
+  - [ ]* 23.5 Write unit tests for API Gateway
+    - Test rate limit enforcement, 429 response structure, versioning header, analytics aggregation
+    - _Requirements: 20.2, 20.3, 20.4_
+
+- [x] 24. REST API endpoints
+  - [x] 24.1 Implement shipment endpoints: `GET /api/v1/shipments`, `GET /api/v1/shipments/{id}`, `POST /api/v1/shipments`, `PATCH /api/v1/shipments/{id}`
+    - Include risk_score, ETA, confidence interval, active route, demand_priority in response
+    - _Requirements: 1.4, 10.5, 20.1_
+  - [x] 24.2 Implement recommendation endpoints: `GET /api/v1/shipments/{id}/recommendations`, `POST /api/v1/shipments/{id}/recommendations/{rec_id}/accept`, `POST /api/v1/shipments/{id}/recommendations/{rec_id}/reject`
+    - _Requirements: 4.6, 20.1_
+  - [x] 24.3 Implement risk and disruption endpoints: `GET /api/v1/shipments/{id}/risk-history`, `GET /api/v1/disruptions`, `GET /api/v1/regions/{id}/risk`
+    - _Requirements: 2.2, 20.1_
+  - [x] 24.4 Implement alert endpoints: `GET /api/v1/alerts`, `GET /api/v1/alerts/{id}`, `GET /api/v1/alerts/{id}/deliveries`
+    - _Requirements: 5.3, 20.1_
+  - [x] 24.5 Implement carrier endpoints: `GET /api/v1/carriers`, `GET /api/v1/carriers/{id}/profile`, `GET /api/v1/carriers/{id}/risk-history`
+    - _Requirements: 14.4, 20.1_
+  - [x] 24.6 Implement AI endpoints: `POST /api/v1/ai/chat`, `GET /api/v1/shipments/{id}/ai-explanation`, `POST /api/v1/ai/reports/narrative`
+    - _Requirements: 25.2, 25.3, 25.6, 20.1_
+  - [x] 24.7 Implement Digital Twin endpoints: `POST /api/v1/digital-twin/scenarios`, `GET /api/v1/digital-twin/scenarios/{id}`, `GET /api/v1/digital-twin/scenarios/{id}/report`
+    - _Requirements: 12.3, 12.5, 20.1_
+  - [x] 24.8 Implement reporting endpoints: `GET /api/v1/reports/carrier-performance`, `GET /api/v1/reports/disruption-frequency`, `GET /api/v1/reports/risk-score-trend` — support CSV and JSON export, 30-second SLA for 90-day queries
+    - _Requirements: 7.2, 7.3, 7.4_
+  - [x] 24.9 Implement carbon endpoints: `GET /api/v1/shipments/{id}/carbon`, `GET /api/v1/carbon/summary`
+    - _Requirements: 13.4, 20.1_
+  - [x] 24.10 Implement edge sync endpoint: `POST /api/v1/edge/sync` — accepts batched buffered events from Edge Agents; processes in chronological order
+    - _Requirements: 19.2_
+  - [x] 24.11 Implement decision audit endpoint: `GET /api/v1/decisions/audit` with configurable lookback, restricted to Manager/Admin
+    - _Requirements: 11.4_
+  - [ ]* 24.12 Write unit tests for REST API endpoints
+    - Test RBAC enforcement per endpoint, tenant isolation in responses, pagination, CSV/JSON export, 429 structure
+    - _Requirements: 8.3, 8.1, 7.4, 20.2_
+
+- [x] 25. GraphQL API
+  - [x] 25.1 Implement GraphQL schema (Strawberry or Ariadne): types for `Shipment`, `Route`, `RouteLeg`, `RerouteRecommendation`, `Alert`, `GeopoliticalRegion`, `CarrierProfile`, `AIExplanation`
+    - _Requirements: 20.1_
+  - [x] 25.2 Implement GraphQL queries: `shipment(id)`, `shipments(filter)`, `disruptions(filter)`, `region(id)`, `carrierProfile(id)`, `alerts(filter)`, `decisionAudit(lookback)`
+    - _Requirements: 20.1_
+  - [x] 25.3 Implement GraphQL mutations: `acceptRerouteRecommendation`, `rejectRerouteRecommendation`, `manualOverride`, `createScenario`
+    - _Requirements: 4.6, 11.3, 12.4, 20.1_
+  - [x] 25.4 Implement GraphQL subscriptions: `riskScoreUpdated(tenantId)`, `alertCreated(tenantId)`, `shipmentPositionUpdated(shipmentId)` — backed by Redis pub/sub
+    - _Requirements: 20.1, 9.5_
+  - [ ]* 25.5 Write unit tests for GraphQL API
+    - Test query depth limiting, subscription fan-out, mutation RBAC, tenant isolation in resolvers
+    - _Requirements: 8.1, 8.3, 20.1_
+
+- [ ] 26. Checkpoint — API layer
+  - Ensure all REST and GraphQL endpoints return correct data, RBAC is enforced, rate limiting fires correctly, and all property tests pass. Ask the user if questions arise.
+
+- [x] 27. Map Visualizer frontend (Mapbox GL JS)
+  - [x] 27.1 Scaffold React + TypeScript frontend with Vite; install Mapbox GL JS, React Query, Zustand, and WebSocket client
+    - _Requirements: 9.1_
+  - [x] 27.2 Implement shipment marker layer: color-coded markers (green 0–39, amber 40–69, red 70–100) with clustering at low zoom; updates via WebSocket subscription within 30 seconds
+    - _Requirements: 9.1, 9.5_
+  - [x] 27.3 Implement active route path and disruption event overlay layers
+    - _Requirements: 9.2_
+  - [x] 27.4 Implement congestion and risk heatmap layers derived from aggregated Risk_Scores
+    - _Requirements: 9.3, 23.4_
+  - [x] 27.5 Implement War_State overlay layer: Restricted=red, High_Risk=orange, Caution=yellow, Safe=no overlay; sourced from GeoJSON region geometries
+    - _Requirements: 9.4, 21.6_
+  - [x] 27.6 Implement filter controls: region, carrier, Risk_Score range; updates map view reactively
+    - _Requirements: 9.6_
+  - [x] 27.7 Implement historical playback mode: time-range selector, step-through of shipment positions and Risk_Score states from TimescaleDB
+    - _Requirements: 9.7_
+  - [x] 27.8 Implement demand forecast heatmap layer toggled from map controls
+    - _Requirements: 15.4_
+  - [x] 27.9 Implement geopolitical news feed panel alongside map
+    - _Requirements: 22.5_
+  - [ ]* 27.10 Write property test for War_State overlay color correctness
+    - **Property 22: War_State Overlay Color Correctness**
+    - **Validates: Requirements 9.4, 21.6**
+  - [ ]* 27.11 Write property test for shipment marker color correctness
+    - **Property 23: Shipment Marker Color Correctness**
+    - **Validates: Requirements 9.1**
+  - [ ]* 27.12 Write unit tests for Map Visualizer components
+    - Test color mapping functions, filter logic, playback step sequencing, WebSocket update handling
+    - _Requirements: 9.1, 9.4, 9.5, 9.6, 9.7_
+
+- [x] 28. Dashboard frontend (React SPA)
+  - [x] 28.1 Implement active shipment list panel: displays Risk_Score, ETA with confidence interval, carrier, demand_priority; sortable and filterable; accessible to all roles
+    - _Requirements: 1.4, 10.5_
+  - [x] 28.2 Implement global risk alert panel: Critical and Warning alerts sorted by severity and recency; real-time updates via WebSocket
+    - _Requirements: 24.4_
+  - [x] 28.3 Implement carrier risk profiles panel with trend charts (on-time rate, incident count, risk score over time); accessible to Analyst/Manager/Admin
+    - _Requirements: 14.4_
+  - [x] 28.4 Implement pre-built report templates UI: on-time delivery by carrier, disruption frequency by node, Risk_Score trend; CSV/JSON export buttons
+    - _Requirements: 7.3, 7.4_
+  - [x] 28.5 Implement CO₂ emissions summary panel with time-period selector
+    - _Requirements: 13.4_
+  - [x] 28.6 Implement Decision Engine audit trail panel: paginated list of autonomous decisions and overrides; accessible to Manager/Admin
+    - _Requirements: 11.4_
+  - [x] 28.7 Implement developer analytics panel: API call volume, error rates, latency percentiles per API key; accessible to Admin
+    - _Requirements: 20.3_
+  - [x] 28.8 Implement AI chatbot panel: text input, conversation history, latency indicator, fallback mode badge
+    - _Requirements: 25.3_
+  - [x] 28.9 Implement Gemini risk explanation inline in shipment detail view; shows explanation text, `generatedAt`, and `fallbackUsed` indicator
+    - _Requirements: 25.2_
+  - [x] 28.10 Implement UI route guards: hide/disable controls and routes based on JWT role claim; enforce at React Router level
+    - _Requirements: 8.7_
+  - [ ]* 28.11 Write unit tests for Dashboard components
+    - Test role-based panel visibility, alert sort order, report export trigger, chatbot message rendering
+    - _Requirements: 8.7, 24.4, 7.3_
+
+- [x] 29. Historical analytics and reporting
+  - [x] 29.1 Implement TimescaleDB continuous aggregates for hourly and daily Risk_Score bucketing; materialized views for carrier on-time rate and disruption frequency
+    - _Requirements: 7.2_
+  - [x] 29.2 Implement report query service: executes pre-built report queries with 25-second timeout and partial result fallback; enforces 24-month data retention via TimescaleDB chunk compression policy
+    - _Requirements: 7.1, 7.2_
+  - [x] 29.3 Implement CSV and JSON export serializers for all report types
+    - _Requirements: 7.4_
+  - [ ]* 29.4 Write property test for data retention invariant
+    - **Property 41: Data Retention Invariant**
+    - **Validates: Requirements 7.1, 17.4**
+  - [ ]* 29.5 Write unit tests for historical analytics
+    - Test 30-second SLA for 90-day queries, CSV/JSON output format, retention policy enforcement
+    - _Requirements: 7.2, 7.4_
+
+- [ ] 30. Checkpoint — Frontend and analytics
+  - Ensure Map Visualizer renders correctly, Dashboard panels display accurate data, report exports work, all property tests pass. Ask the user if questions arise.
+
+- [ ] 31. Integration tests
+  - [ ] 31.1 Write Kafka integration tests using `testcontainers`: verify end-to-end flow from ingestion event → Risk Engine → Routing Engine → Decision Engine → Notification Service with ephemeral Kafka container
+    - _Requirements: 2.3, 4.4, 5.1_
+  - [ ] 31.2 Write PostgreSQL integration tests using `testcontainers`: verify RLS policies block cross-tenant queries, migrations apply cleanly, TimescaleDB hypertable inserts and queries work
+    - _Requirements: 8.1, 7.1_
+  - [ ] 31.3 Write Gemini API integration tests against mock server (recorded responses): verify fallback activation, audit log creation, chatbot context injection
+    - _Requirements: 25.8, 25.9_
+  - [ ] 31.4 Write Edge Agent sync integration tests: simulate offline period, buffer events, reconnect, verify chronological upload and 60-second SLA
+    - _Requirements: 19.2_
+  - [ ] 31.5 Write Digital Twin integration tests: submit scenario, verify 60-second completion, verify report completeness
+    - _Requirements: 12.3, 12.5_
+
+- [ ] 32. Performance tests
+  - [ ] 32.1 Write `locust` load test targeting 50,000 events/minute ingestion throughput; verify Kafka consumer lag stays below 5 seconds
+    - _Requirements: 6.5_
+  - [ ] 32.2 Write latency test verifying Risk_Score update within 2 minutes under full load (1M shipments, 50K events/min)
+    - _Requirements: 2.3_
+  - [ ] 32.3 Write report query performance test verifying 30-second response for 90-day queries under concurrent load
+    - _Requirements: 7.2_
+  - [ ] 32.4 Write Digital Twin performance test verifying 60-second simulation completion for 10,000-shipment scenario
+    - _Requirements: 12.3_
+
+- [ ] 33. Security tests
+  - [ ] 33.1 Write RBAC matrix tests: every (role, endpoint) combination tested for correct allow/deny; verify `403` response and audit log entry on denial
+    - _Requirements: 8.3, 8.7_
+  - [ ] 33.2 Write tenant isolation penetration tests: JWT manipulation attempts (modified `tenant_id` claim, missing claim, cross-tenant resource IDs) must all return `403` with no data leakage
+    - _Requirements: 8.1, 8.2_
+  - [ ] 33.3 Write rate limiting tests: verify `429` response, correct `Retry-After` header, and structured JSON error body; verify no data returned in 429 response
+    - _Requirements: 20.2_
+  - [ ] 33.4 Write MFA bypass attempt tests: verify single-factor auth rejected for MFA-enabled tenants; verify TOTP replay attack rejected
+    - _Requirements: 8.6_
+
+- [ ] 34. Final checkpoint — Full system integration
+  - Ensure all services integrate correctly end-to-end, all 45 property tests pass, integration tests pass with testcontainers, performance benchmarks meet SLAs, and security tests confirm no data leakage. Ask the user if questions arise.
+
+## Notes
+
+- Tasks marked with `*` are optional and can be skipped for a faster MVP
+- Each task references specific requirements for traceability
+- Checkpoints ensure incremental validation at each major milestone
+- Property tests validate all 45 correctness properties from the design document
+- Unit tests validate specific examples, edge cases, and error conditions
+- All property tests use `hypothesis` with `@settings(max_examples=100)` minimum; security properties (19, 20, 21) use `max_examples=500`
+- Performance tests use `locust`; integration tests use `testcontainers` for ephemeral Kafka and PostgreSQL
